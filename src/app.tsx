@@ -23,7 +23,6 @@ import {XDFParser} from './lib/xdfParser';
 import {parseOLS, extractBinary, olsToDefinition} from './lib/olsParser';
 import type {OLSFile, OLSBinaryVersion} from './lib/olsParser';
 import {OLSPickerModal} from './components/OLSPickerModal';
-import {DeprecationModal} from './components/DeprecationModal.tsx';
 import './app.css';
 
 const BIN_EXTENSIONS = ['.bin', '.ori', '.mod'];
@@ -42,29 +41,6 @@ function classifyFile(name: string): 'json' | 'bin' | 'csv' | 'xdf' | 'ols' | nu
 export function App() {
     const appState = useAppState();
     const logState = useLogState();
-
-    // Load log from URL parameter ?log=<id>
-    useEffect(() => {
-        const params = new URLSearchParams(window.location.search);
-        const logId = params.get('log');
-        if (!logId) {
-            return;
-        }
-        fetch(`https://simos.app/api/files/download?id=${encodeURIComponent(logId)}`)
-            .then(res => {
-                if (!res.ok) {
-                    throw new Error(`HTTP ${res.status}`);
-                }
-                return res.text();
-            })
-            .then(text => {
-                setLogViewerData(text);
-                setShowLogViewer(true);
-                logState.setLog(parseCSV(text), `log:${logId}`);
-                track('Load Log URL', {id: logId, size: text.length});
-            })
-            .catch(err => console.error('Failed to load log:', err));
-    }, []);
 
     // Warn before closing with unsaved changes
     useEffect(() => {
@@ -252,8 +228,6 @@ export function App() {
                         onClose={() => setOlsData(null)}
                     />
                 )}
-                {/* Shown once per browser session. */}
-                <DeprecationModal/>
             </div>
             </LogContext.Provider>
         </AppContext.Provider>
