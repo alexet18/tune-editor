@@ -3,11 +3,6 @@ import {parseEcuInfo} from '../lib/btpParser';
 import {useAppContext} from '../context/app';
 import {Modal} from './Modal';
 import {LoginModal} from './LoginModal';
-import {AuthService} from '../services/auth';
-import type {LoginState} from '../services/auth';
-import {getLoginState} from '../services/base';
-import {TuningService} from '../services/tuning';
-import type {TuningFileEntry} from '../services/tuning';
 import {track} from '../lib/track';
 
 const APP_VERSION = __APP_VERSION__;
@@ -35,56 +30,14 @@ export function MenuBar({
     const ctx = useAppContext();
     const [showFileMenu, setShowFileMenu] = useState(false);
     const [showMobileMenu, setShowMobileMenu] = useState(false);
-    const [showAbout, setShowAbout] = useState(false);
     const [showSaveDialog, setShowSaveDialog] = useState(false);
     const [saveFileName, setSaveFileName] = useState('');
-    const [showLogin, setShowLogin] = useState(false);
-    const [showCloudBins, setShowCloudBins] = useState(false);
-    const [loginState, setLoginState] = useState<LoginState | null>(() => getLoginState());
-    const [cloudBins, setCloudBins] = useState<TuningFileEntry[]>([]);
-    const [cloudBinsLoading, setCloudBinsLoading] = useState(false);
-    const [cloudBinError, setCloudBinError] = useState<string | null>(null);
-    const [downloadingBin, setDownloadingBin] = useState<{name: string; loaded: number; total: number} | null>(null);
-
     const jsonInputRef = useRef<HTMLInputElement>(null);
     const binInputRef = useRef<HTMLInputElement>(null);
     const originalBinInputRef = useRef<HTMLInputElement>(null);
     const crossCompareBinInputRef = useRef<HTMLInputElement>(null);
     const olsInputRef = useRef<HTMLInputElement>(null);
 
-    useEffect(() => {
-        const stored = getLoginState();
-        if (!stored) return;
-        AuthService.self().then(user => {
-            const refreshed = {...stored, user};
-            localStorage.setItem('login', JSON.stringify(refreshed));
-            setLoginState(refreshed);
-        }).catch(() => {
-            localStorage.removeItem('login');
-            localStorage.removeItem('login_renewed');
-            setLoginState(null);
-        });
-    }, []);
-
-    useEffect(() => {
-        if (!loginState) {
-            setCloudBins([]);
-            setCloudBinError(null);
-            return;
-        }
-
-        let cancelled = false;
-        setCloudBinsLoading(true);
-        setCloudBinError(null);
-        TuningService.listBins().then(entries => {
-            if (!cancelled) setCloudBins(entries);
-        }).catch(error => {
-            if (!cancelled) setCloudBinError((error as Error).message || 'Failed to load Cloud Bins');
-        }).finally(() => {
-            if (!cancelled) setCloudBinsLoading(false);
-        });
-        return () => { cancelled = true; };
-    }, [loginState]);
 
     const closeMenus = useCallback(() => {
         setShowFileMenu(false);
@@ -146,38 +99,6 @@ export function MenuBar({
         ctx.exportBtp();
         closeMenus();
     }, [closeMenus, ctx]);
-
-    const handleCloudBins = useCallback(() => {
-        closeMenus();
-        if (loginState) setShowCloudBins(true);
-        else setShowLogin(true);
-    }, [closeMenus, loginState]);
-
-    const handleLogout = useCallback(() => {
-        localStorage.removeItem('login');
-        localStorage.removeItem('login_renewed');
-        setLoginState(null);
-        setCloudBins([]);
-        setShowCloudBins(false);
-        closeMenus();
-    }, [closeMenus]);
-
-    const handleOpenCloudBin = useCallback(async (entry: TuningFileEntry) => {
-        setDownloadingBin({name: entry.name, loaded: 0, total: 0});
-        setCloudBinError(null);
-        try {
-            const data = await TuningService.getBin(entry.id, (loaded, total) => {
-                setDownloadingBin({name: entry.name, loaded, total});
-            });
-            await ctx.loadBin(new File([data], entry.name, {type: 'application/octet-stream'}));
-            setShowCloudBins(false);
-            track('Download Cloud Bin in Legacy Editor', {id: entry.id, name: entry.name});
-        } catch (error) {
-            setCloudBinError((error as Error).message || 'Failed to download Cloud Bin');
-        } finally {
-            setDownloadingBin(null);
-        }
-    }, [ctx]);
 
     const mobileAction = (action: () => void) => () => {
         action();
@@ -313,22 +234,7 @@ export function MenuBar({
                         Compare ({ctx.crossCompareDiffs.length})
                     </button>
                 )}
-                <button onClick={() => setShowAbout(true)} class="px-3 py-1 text-sm rounded hover:bg-zinc-200 dark:hover:bg-zinc-700 cursor-pointer">About</button>
-                <button
-                    onClick={handleCloudBins}
-                    class="px-3 py-1 text-sm rounded bg-blue-600 text-white hover:bg-blue-500 cursor-pointer"
-                >
-                    Cloud Bins
-                </button>
-                {loginState && (
-                    <button
-                        onClick={handleLogout}
-                        class="px-2 py-1 text-xs rounded text-zinc-500 hover:bg-zinc-200 hover:text-zinc-900 dark:hover:bg-zinc-700 dark:hover:text-zinc-100 cursor-pointer"
-                        title={`Logged in as ${loginState.user.fullName || loginState.user.login}`}
-                    >
-                        Logout
-                    </button>
-                )}
+           
             </div>
 
             <div class="flex-1 min-w-0 flex justify-end">{statusBadges}</div>
@@ -364,67 +270,11 @@ export function MenuBar({
                             </button>
                         )}
                         <div class="border-t border-zinc-300 dark:border-zinc-700 my-1"/>
-                        <button onClick={mobileAction(handleCloudBins)} class="w-full text-left px-4 py-3 text-sm font-medium text-blue-600 hover:bg-zinc-200 dark:text-blue-400 dark:hover:bg-zinc-700">
-                            {loginState ? 'Open existing Cloud Bins' : 'Login for Cloud Bins'}
-                        </button>
-                        {loginState && (
-                            <button onClick={mobileAction(handleLogout)} class="w-full text-left px-4 py-3 text-sm hover:bg-zinc-200 dark:hover:bg-zinc-700">
-                                Logout {loginState.user.fullName || loginState.user.login}
-                            </button>
-                        )}
                         <div class="border-t border-zinc-300 dark:border-zinc-700 my-1"/>
-                        <button onClick={mobileAction(() => setShowAbout(true))} class="w-full text-left px-4 py-3 text-sm hover:bg-zinc-200 dark:hover:bg-zinc-700">About</button>
                     </div>
                 </>
             )}
 
-            {showLogin && (
-                <LoginModal
-                    onClose={() => setShowLogin(false)}
-                    onLogin={state => {
-                        setLoginState(state);
-                        setShowCloudBins(true);
-                    }}
-                />
-            )}
-
-            {showCloudBins && loginState && (
-                <Modal title="Existing Cloud Bins" onClose={() => !downloadingBin && setShowCloudBins(false)} width="lg">
-                    <div class="space-y-3">
-                        <div class="rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-800 dark:border-blue-900 dark:bg-blue-950/40 dark:text-blue-200">
-                            Cloud access is read-only in the Legacy Editor. Load an existing BIN, edit it locally, then download the result.
-                        </div>
-                        {cloudBinsLoading && <div class="py-6 text-center text-sm text-zinc-500">Loading Cloud Bins…</div>}
-                        {cloudBinError && <div class="rounded bg-red-500/10 px-3 py-2 text-sm text-red-500">{cloudBinError}</div>}
-                        {!cloudBinsLoading && !cloudBinError && cloudBins.length === 0 && (
-                            <div class="py-6 text-center text-sm text-zinc-500">No existing Cloud Bins found.</div>
-                        )}
-                        {cloudBins.length > 0 && (
-                            <div class="max-h-96 space-y-1 overflow-y-auto">
-                                {cloudBins.map(entry => {
-                                    const isDownloading = downloadingBin?.name === entry.name;
-                                    const percent = isDownloading && downloadingBin.total > 0
-                                        ? Math.round((downloadingBin.loaded / downloadingBin.total) * 100)
-                                        : null;
-                                    return (
-                                        <button
-                                            key={entry.id}
-                                            onClick={() => void handleOpenCloudBin(entry)}
-                                            disabled={!!downloadingBin}
-                                            class="flex w-full items-center justify-between gap-3 rounded border border-zinc-300 bg-zinc-100 px-3 py-2.5 text-left hover:bg-zinc-200 disabled:cursor-wait disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-800 dark:hover:bg-zinc-700"
-                                        >
-                                            <span class="truncate font-mono text-sm" title={entry.name}>{entry.name}</span>
-                                            <span class="shrink-0 text-xs font-medium text-blue-600 dark:text-blue-400">
-                                                {isDownloading ? (percent == null ? 'Loading…' : `${percent}%`) : 'Load'}
-                                            </span>
-                                        </button>
-                                    );
-                                })}
-                            </div>
-                        )}
-                    </div>
-                </Modal>
-            )}
 
             {showSaveDialog && (
                 <Modal
@@ -452,28 +302,7 @@ export function MenuBar({
                 </Modal>
             )}
 
-            {showAbout && (
-                <Modal title="About" onClose={() => setShowAbout(false)} width="sm">
-                    <div class="flex flex-col items-center gap-4 py-4 text-center">
-                        <img src="logo.svg" alt="Tune Editor" class="w-16 h-16"/>
-                        <div>
-                            <div class="text-lg font-semibold">Tune Editor</div>
-                            <div class="text-sm text-zinc-500">v{APP_VERSION} · deprecated legacy editor</div>
-                        </div>
-                        <a
-                            href={MANAGED_EDITOR_URL}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            class="px-4 py-2 text-sm rounded bg-blue-600 text-white hover:bg-blue-700"
-                        >
-                            Go to new Editor — 33% off
-                        </a>
-                        <div class="text-xs text-zinc-500">
-                            August offer: use code <code class="font-semibold text-zinc-700 dark:text-zinc-300">LEGACYEDITOR</code>
-                        </div>
-                    </div>
-                </Modal>
-            )}
+
         </header>
     );
 }
