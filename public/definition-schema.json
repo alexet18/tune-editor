@@ -20,6 +20,31 @@
       "required": ["a", "b", "c", "d"],
       "additionalProperties": false
     },
+    "ConditionalMathBranch": {
+      "type": "object",
+      "properties": {
+        "equals": { "type": "integer" },
+        "factor": { "type": "number" },
+        "offset": { "type": "number" },
+        "formula": { "$ref": "#/$defs/RationalFormula" }
+      },
+      "required": ["factor", "offset"],
+      "additionalProperties": false
+    },
+    "ConditionalMath": {
+      "type": "object",
+      "description": "Conversion selected at runtime from a byte in the binary (MHD+ IF() math)",
+      "properties": {
+        "address": { "type": "integer" },
+        "branches": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ConditionalMathBranch" }
+        },
+        "fallback": { "$ref": "#/$defs/ConditionalMathBranch" }
+      },
+      "required": ["address", "branches", "fallback"],
+      "additionalProperties": false
+    },
     "AxisDefinition": {
       "type": "object",
       "properties": {
@@ -36,6 +61,7 @@
         "factor":      { "type": "number" },
         "offset":      { "type": "number" },
         "formula":     { "$ref": "#/$defs/RationalFormula" },
+        "conditional": { "$ref": "#/$defs/ConditionalMath" },
         "dataOffset":  { "type": "integer" },
         "labels": {
           "type": "array",
@@ -48,6 +74,7 @@
     "IDefinitionParameter": {
       "type": "object",
       "properties": {
+        "id":          { "type": "string" },
         "name":        { "type": "string" },
         "description": { "type": "string" },
         "address":     { "type": "integer" },
@@ -62,6 +89,7 @@
         "factor":      { "type": "number" },
         "offset":      { "type": "number" },
         "formula":     { "$ref": "#/$defs/RationalFormula" },
+        "conditional": { "$ref": "#/$defs/ConditionalMath" },
         "xAxis":       { "$ref": "#/$defs/AxisDefinition" },
         "yAxis":       { "$ref": "#/$defs/AxisDefinition" },
         "rows":        { "type": "integer", "minimum": 1 },
@@ -73,6 +101,13 @@
           "items": { "type": "string" }
         },
         "customName":  { "type": "string" },
+        "enumLabels": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[0-9]+$"
+          },
+          "additionalProperties": { "type": "string" }
+        },
         "bitLabels": {
           "type": "object",
           "propertyNames": {

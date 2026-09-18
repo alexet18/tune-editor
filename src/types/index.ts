@@ -10,6 +10,27 @@ export interface RationalFormula {
     d: number;
 }
 
+/** One conditional conversion branch: used when the selector byte at `address` equals `equals`. */
+export interface ConditionalMathBranch {
+    /** Selector byte value that picks this branch (absent on the fallback). */
+    equals?: number;
+    factor: number;
+    offset: number;
+    formula?: RationalFormula;
+}
+
+/**
+ * Conversion that is selected at runtime by a single byte in the binary
+ * (MHD+ "dynamic axis" tables, e.g. `IF(A==1;X*0.01;X*0.0018129717)` ).
+ * The selector byte lives in the same address space as parameter addresses.
+ */
+export interface ConditionalMath {
+    /** BIN offset of the selector byte. */
+    address: number;
+    branches: ConditionalMathBranch[];
+    fallback: ConditionalMathBranch;
+}
+
 export interface ILoadedBin {
     name: string;
     data: Uint8Array,
@@ -30,6 +51,7 @@ export interface AxisDefinition {
     factor?: number;
     offset?: number;
     formula?: RationalFormula;  // Non-linear conversion: (a*X+b)/(c+d*X)
+    conditional?: ConditionalMath;  // Conversion selected at runtime from a config byte
     dataOffset?: number; // Byte offset where axis data starts
     labels?: string[];   // Fixed labels for FIX_AXIS (e.g. ["1->2", "2->3", "3->4"])
 }
@@ -48,6 +70,7 @@ export interface IDefinitionParameter {
     factor: number;
     offset: number;
     formula?: RationalFormula;  // Non-linear conversion: (a*X+b)/(c+d*X)
+    conditional?: ConditionalMath;  // Conversion selected at runtime from a config byte
     xAxis?: AxisDefinition;
     yAxis?: AxisDefinition;
     rows?: number;
