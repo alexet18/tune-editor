@@ -83,7 +83,7 @@ export function App() {
         } else if (type === 'xdf') {
             const parser = new XDFParser();
             await parser.parseXDF(file);
-            const def = parser.generateDefinition();
+            const def = parser.generateDefinition(file.name);
             console.log(`XDF: ${def.parameters.length} parameters from ${file.name}`);
             appState.setExternalDefinition(def);
             appState.setSelectedParam(null);

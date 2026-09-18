@@ -15,7 +15,7 @@ export function XdfLoader({onDefinitionLoad}: Props) {
 
         const parser = new XDFParser();
         await parser.parseXDF(file);
-        const definition = parser.generateDefinition();
+        const definition = parser.generateDefinition(file.name);
         onDefinitionLoad(definition);
 
         if (xdfRef.current) xdfRef.current.value = '';

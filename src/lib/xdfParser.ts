@@ -1,19 +1,8 @@
-import type {IDefinitionParameter, DataType, AxisDefinition, Definition, RationalFormula} from '../types';
+import type {IDefinitionParameter, DataType, AxisDefinition, Definition, RationalFormula, ConditionalMath, ConditionalMathBranch} from '../types';
 
 // --- Math equation parsing ---
-
-function fixFloat(s: string): number {
-    s = s.trim();
-    // Handle malformed values like '2.66667.0' (double decimal point)
-    const firstDot = s.indexOf('.');
-    if (firstDot >= 0) {
-        const secondDot = s.indexOf('.', firstDot + 1);
-        if (secondDot >= 0) s = s.slice(0, secondDot);
-    }
-    return parseFloat(s);
-}
-
-const NUM = '[\\d.\\-+eE]+';
+// The full evaluator lives below; it handles linear / chained / rational and
+// MHD+ `IF()` conditional conversions.
 
 // Keep these in sync with tools/parse_xdf.py. Some generated XDFs use named
 // array indices in their technical IDs while A2L/JSON definitions use numbers.
@@ -93,50 +82,298 @@ function parseInteger(value: string | null, fallback: number): number {
     return Number.isNaN(parsed) ? fallback : parsed;
 }
 
-function parseMathEquation(equation: string): { factor: number; offset: number; formula?: RationalFormula } {
-    equation = equation.trim();
+export interface ResolvedMath {
+    factor: number;
+    offset: number;
+    formula?: RationalFormula;
+    conditional?: ConditionalMath;
+}
 
-    // Identity: X or x
-    if (/^[xX]$/.test(equation)) return {factor: 1, offset: 0};
+type MathToken =
+    | {t: 'num'; v: number}
+    | {t: 'x'}
+    | {t: 'op'; v: string};
 
-    // General rational function: ((a * X) op1 b) / (c op2 (d * X))
-    // Matches forms like: ((0.0 * X) + 6622.0) / (1.0 + (1.0 * X))
-    //                     ((a * X) - b) / (c - (d * X))
-    const ratGen = equation.match(
-        new RegExp(`^\\(\\s*\\(\\s*(${NUM})\\s*\\*\\s*X\\s*\\)\\s*([+-])\\s*(${NUM})\\s*\\)\\s*/\\s*\\(\\s*(${NUM})\\s*([+-])\\s*\\(\\s*(${NUM})\\s*\\*\\s*X\\s*\\)\\s*\\)$`, 'i')
-    );
-    if (ratGen) {
-        const a = fixFloat(ratGen[1]);
-        const b = fixFloat(ratGen[3]) * (ratGen[2] === '-' ? -1 : 1);
-        const c = fixFloat(ratGen[4]);
-        const d = fixFloat(ratGen[6]) * (ratGen[5] === '-' ? -1 : 1);
-        // If d=0 it's linear: (a*X + b) / c
-        if (d === 0 && c !== 0) return {factor: a / c, offset: b / c};
-        // Non-linear: return formula
-        return {factor: 1, offset: 0, formula: {a, b, c, d}};
+type Poly = number[];
+
+interface Rat {
+    num: Poly; // polynomial in X, ascending degree
+    den: Poly;
+}
+
+const RAT_X: Rat = {num: [0, 1], den: [1]};
+
+function trimPoly(p: Poly): Poly {
+    while (p.length > 1 && Math.abs(p[p.length - 1]) < 1e-15) p.pop();
+    return p;
+}
+
+function polyAdd(a: Poly, b: Poly): Poly {
+    const out = new Array(Math.max(a.length, b.length)).fill(0);
+    for (let i = 0; i < a.length; i++) out[i] += a[i];
+    for (let i = 0; i < b.length; i++) out[i] += b[i];
+    return trimPoly(out);
+}
+
+function polyMul(a: Poly, b: Poly): Poly {
+    const out = new Array(a.length + b.length - 1).fill(0);
+    for (let i = 0; i < a.length; i++) {
+        if (a[i] === 0) continue;
+        for (let j = 0; j < b.length; j++) {
+            if (b[j] !== 0) out[i + j] += a[i] * b[j];
+        }
+    }
+    return trimPoly(out);
+}
+
+function ratMul(a: Rat, b: Rat): Rat {
+    return {num: polyMul(a.num, b.num), den: polyMul(a.den, b.den)};
+}
+
+function ratDiv(a: Rat, b: Rat): Rat {
+    return {num: polyMul(a.num, b.den), den: polyMul(a.den, b.num)};
+}
+
+function ratAdd(a: Rat, b: Rat): Rat {
+    return {num: trimPoly(polyAdd(polyMul(a.num, b.den), polyMul(b.num, a.den))), den: polyMul(a.den, b.den)};
+}
+
+function ratSub(a: Rat, b: Rat): Rat {
+    return {num: trimPoly(polyAdd(polyMul(a.num, b.den), polyMul(b.num, a.den).map(c => -c))), den: polyMul(a.den, b.den)};
+}
+
+/** Fold `+-` / `-+` / `--` / `++` sign pairs left by MHD+ exports. */
+function collapseSigns(e: string): string {
+    let s = e;
+    for (let i = 0; i < 4; i++) {
+        const next = s
+            .replace(/\+\s*\+\s*/g, '+')
+            .replace(/-\s*-\s*/g, '+')
+            .replace(/\+\s*-\s*/g, '-')
+            .replace(/-\s*\+\s*/g, '-');
+        if (next === s) break;
+        s = next;
+    }
+    return s;
+}
+
+function tokenizeMath(expr: string): MathToken[] {
+    const toks: MathToken[] = [];
+    let i = 0;
+    while (i < expr.length) {
+        const ch = expr[i];
+        if (/[0-9]/.test(ch)) {
+            const m = expr.slice(i).match(/^[0-9]*\.?[0-9]+([eE][+-]?[0-9]+)?/);
+            if (!m) throw new Error(`Bad number in equation at ${i}`);
+            toks.push({t: 'num', v: parseFloat(m[0])});
+            i += m[0].length;
+        } else if (ch === '.') {
+            const m = expr.slice(i).match(/^\.\d+([eE][+-]?\d+)?/);
+            if (!m) throw new Error(`Bad decimal in equation at ${i}`);
+            toks.push({t: 'num', v: parseFloat(m[0])});
+            i += m[0].length;
+        } else if (ch === 'x' || ch === 'X') {
+            toks.push({t: 'x'});
+            i++;
+        } else if (/\s/.test(ch)) {
+            i++;
+        } else if (ch === '+' || ch === '-' || ch === '*' || ch === '/' || ch === '(' || ch === ')') {
+            toks.push({t: 'op', v: ch});
+            i++;
+        } else {
+            throw new Error(`Unexpected char ${ch} in equation`);
+        }
+    }
+    return toks;
+}
+
+function parseMathPrimary(toks: MathToken[], pos: {i: number}): Rat {
+    const tok = toks[pos.i];
+    if (!tok) throw new Error('Unexpected end of equation');
+    if (tok.t === 'num') {
+        pos.i++;
+        return {num: [tok.v], den: [1]};
+    }
+    if (tok.t === 'x') {
+        pos.i++;
+        return {num: [0, 1], den: [1]};
+    }
+    if (tok.t === 'op' && tok.v === '(') {
+        pos.i++;
+        const inner = parseMathAddSub(toks, pos);
+        const close = toks[pos.i];
+        if (close && close.t === 'op' && close.v === ')') pos.i++;
+        return inner;
+    }
+    throw new Error('Unexpected token in equation');
+}
+
+function parseMathUnary(toks: MathToken[], pos: {i: number}): Rat {
+    const tok = toks[pos.i];
+    if (tok && tok.t === 'op' && (tok.v === '+' || tok.v === '-')) {
+        pos.i++;
+        const operand = parseMathUnary(toks, pos);
+        return tok.v === '-' ? ratMul(operand, {num: [-1], den: [1]}) : operand;
+    }
+    return parseMathPrimary(toks, pos);
+}
+
+function parseMathMulDiv(toks: MathToken[], pos: {i: number}): Rat {
+    let left = parseMathUnary(toks, pos);
+    for (;;) {
+        const tok = toks[pos.i];
+        if (tok && tok.t === 'op' && (tok.v === '*' || tok.v === '/')) {
+            pos.i++;
+            const right = parseMathUnary(toks, pos);
+            left = tok.v === '*' ? ratMul(left, right) : ratDiv(left, right);
+        } else return left;
+    }
+}
+
+function parseMathAddSub(toks: MathToken[], pos: {i: number}): Rat {
+    let left = parseMathMulDiv(toks, pos);
+    for (;;) {
+        const tok = toks[pos.i];
+        if (tok && tok.t === 'op' && (tok.v === '+' || tok.v === '-')) {
+            pos.i++;
+            const right = parseMathMulDiv(toks, pos);
+            left = tok.v === '+' ? ratAdd(left, right) : ratSub(left, right);
+        } else return left;
+    }
+}
+
+function ratToResolved(r: Rat): ResolvedMath {
+    const num = r.num;
+    const den = r.den;
+    // In practice numerator/denominator never exceed degree 1 here.
+    const a = num.length > 1 ? num[1] : 0;
+    const b = num[0] ?? 0;
+    const c = den[0] ?? 1;
+    const d = den.length > 1 ? den[1] : 0;
+    if (Math.abs(d) < 1e-15) {
+        if (Math.abs(c) < 1e-15) return {factor: 1, offset: 0};
+        return {factor: a / c, offset: b / c};
+    }
+    // physical = (a*X + b) / (c + d*X) — non-linear, keep rational formula
+    return {factor: 1, offset: 0, formula: {a, b, c, d}};
+}
+
+function splitTopLevel(s: string, sep: string): string[] {
+    const parts: string[] = [];
+    let depth = 0;
+    let cur = '';
+    for (let i = 0; i < s.length; i++) {
+        const ch = s[i];
+        if (ch === '(') depth++;
+        else if (ch === ')') depth--;
+        if (ch === sep && depth === 0) {
+            parts.push(cur);
+            cur = '';
+        } else cur += ch;
+    }
+    parts.push(cur);
+    return parts;
+}
+
+function evalNumericExpr(expr: string): ResolvedMath {
+    try {
+        const toks = tokenizeMath(expr);
+        const pos = {i: 0};
+        const rat = parseMathAddSub(toks, pos);
+        return ratToResolved(rat);
+    } catch {
+        return {factor: 1, offset: 0};
+    }
+}
+
+function tryParseConditional(expr: string, addressVars: Map<string, number>): ResolvedMath | null {
+    if (!/^IF\s*\(/i.test(expr)) return null;
+
+    let depth = 0;
+    const start = expr.indexOf('(');
+    let end = -1;
+    for (let i = start; i < expr.length; i++) {
+        if (expr[i] === '(') depth++;
+        else if (expr[i] === ')') {
+            depth--;
+            if (depth === 0) {
+                end = i;
+                break;
+            }
+        }
+    }
+    if (end < 0 || end !== expr.length - 1) return null;
+
+    const parts = splitTopLevel(expr.slice(start + 1, end), ';');
+    if (parts.length !== 3) return null;
+
+    const condMatch = parts[0].trim().match(/^([A-Za-z_][A-Za-z0-9_]*)\s*==\s*(-?\d+)$/);
+    if (!condMatch) return null;
+
+    const address = addressVars.get(condMatch[1].trim());
+    if (address === undefined) return null;
+    const equals = parseInt(condMatch[2], 10);
+
+    const thenRes = evalXdfMathEquation(parts[1], addressVars);
+    const elseRes = evalXdfMathEquation(parts[2], addressVars);
+
+    const thenBranch: ConditionalMathBranch = {
+        equals,
+        factor: thenRes.factor,
+        offset: thenRes.offset,
+        formula: thenRes.formula,
+    };
+
+    if (elseRes.conditional && elseRes.conditional.address === address) {
+        return {
+            factor: elseRes.factor,
+            offset: elseRes.offset,
+            formula: elseRes.formula,
+            conditional: {
+                address,
+                branches: [thenBranch, ...elseRes.conditional.branches],
+                fallback: elseRes.conditional.fallback,
+            },
+        };
     }
 
-    // X / divisor
-    const div = equation.match(new RegExp(`^X\\s*/\\s*(${NUM})$`, 'i'));
-    if (div) return {factor: 1 / parseFloat(div[1]), offset: 0};
+    return {
+        factor: elseRes.factor,
+        offset: elseRes.offset,
+        formula: elseRes.formula,
+        conditional: {
+            address,
+            branches: [thenBranch],
+            fallback: {factor: elseRes.factor, offset: elseRes.offset, formula: elseRes.formula},
+        },
+    };
+}
 
-    // X * factor +/- offset
-    const mulOff = equation.match(new RegExp(`^X\\s*\\*\\s*(${NUM})\\s*([+-])\\s*(${NUM})$`, 'i'));
-    if (mulOff) {
-        const f = parseFloat(mulOff[1]);
-        const o = parseFloat(mulOff[3]) * (mulOff[2] === '-' ? -1 : 1);
-        return {factor: f, offset: o};
+/**
+ * Evaluate an XDF MATH equation. `addressVars` maps the ids of VAR elements
+ * that carry a `type="address"` attribute onto their binary offset — used by
+ * the MHD+ `IF()` conditional conversions.
+ */
+export function evalXdfMathEquation(equation: string, addressVars?: Map<string, number>): ResolvedMath {
+    const expr = collapseSigns((equation || 'X').trim());
+    if (!expr) return {factor: 1, offset: 0};
+    const cond = tryParseConditional(expr, addressVars ?? new Map());
+    if (cond) return cond;
+    return evalNumericExpr(expr);
+}
+
+function parseMathElement(mathEl: Element | null): ResolvedMath {
+    const equation = mathEl?.getAttribute('equation') || 'X';
+    const addressVars = new Map<string, number>();
+    if (mathEl) {
+        for (const v of mathEl.querySelectorAll('VAR')) {
+            if ((v.getAttribute('type') || '').toLowerCase() === 'address') {
+                const addr = parseAddress(v.getAttribute('address'));
+                if (addr !== null) addressVars.set((v.getAttribute('id') || '').trim(), addr);
+            }
+        }
     }
-
-    // X * factor
-    const mul = equation.match(new RegExp(`^X\\s*\\*\\s*(${NUM})$`, 'i'));
-    if (mul) return {factor: parseFloat(mul[1]), offset: 0};
-
-    // X +/- offset
-    const addSub = equation.match(new RegExp(`^X\\s*([+-])\\s*(${NUM})$`, 'i'));
-    if (addSub) return {factor: 1, offset: parseFloat(addSub[2]) * (addSub[1] === '-' ? -1 : 1)};
-
-    return {factor: 1, offset: 0};
+    return evalXdfMathEquation(equation, addressVars);
 }
 
 // --- Data type from XDF flags ---
@@ -176,6 +413,8 @@ interface ParsedAxis {
     min: number;
     max: number;
     formula?: RationalFormula;
+    conditional?: ConditionalMath;
+    outputType?: number;
     embedded: boolean;
     points?: number;
     labels?: string[];
@@ -197,48 +436,42 @@ function parseAxisLabels(axisEl: Element): string[] | undefined {
     return labels.length > 0 ? labels : undefined;
 }
 
+function placeholderAxis(points: number, labels?: string[], outputType?: number): ParsedAxis {
+    return {
+        address: 0,
+        dataType: 'UWORD',
+        cols: points,
+        rows: 1,
+        unit: '',
+        factor: 1,
+        offset: 0,
+        min: 0,
+        max: 0,
+        embedded: false,
+        points,
+        labels,
+        outputType,
+    };
+}
+
 function parseAxisElement(axisEl: Element): ParsedAxis | null {
     const embed = axisEl.querySelector('EMBEDDEDDATA') || axisEl.querySelector('embeddedData');
     const indexCountEl = axisEl.querySelector('indexcount');
     const points = parseInt(indexCountEl?.textContent || '1', 10);
     const labels = parseAxisLabels(axisEl);
+    const outputType = parseInteger(axisEl.querySelector('outputtype')?.textContent ?? null, 1);
 
     // No embedded data or no address/typeflags → non-embedded axis
     if (!embed || (!embed.getAttribute('mmedaddress') && !embed.getAttribute('mmedtypeflags'))) {
-        return {
-            address: 0,
-            dataType: 'UWORD',
-            cols: points,
-            rows: 1,
-            unit: '',
-            factor: 1,
-            offset: 0,
-            min: 0,
-            max: 0,
-            embedded: false,
-            points,
-            labels
-        };
+        return placeholderAxis(points, labels, outputType);
     }
 
     const address = parseAddress(embed.getAttribute('mmedaddress')) ?? 0;
 
-    // 0xFFFFFFFF is a sentinel for "no address" (e.g., DSG y-axis placeholders)
-    if (address === 0xFFFFFFFF) {
-        return {
-            address: 0,
-            dataType: 'UWORD',
-            cols: points,
-            rows: 1,
-            unit: '',
-            factor: 1,
-            offset: 0,
-            min: 0,
-            max: 0,
-            embedded: false,
-            points,
-            labels
-        };
+    // 0xFFFFFFFF (DSG) and 0x0 (MHD+) are sentinels for "no address"
+    // placeholder axes — never read real data from offset zero.
+    if (address === 0xFFFFFFFF || address === 0x0) {
+        return placeholderAxis(points, labels, outputType);
     }
 
     const sizeBits = parseInt(embed.getAttribute('mmedelementsizebits') || '16', 10);
@@ -246,11 +479,7 @@ function parseAxisElement(axisEl: Element): ParsedAxis | null {
     const cols = parseInt(embed.getAttribute('mmedcolcount') || '1', 10);
     const rows = parseInt(embed.getAttribute('mmedrowcount') || '1', 10);
 
-    const mathEl = axisEl.querySelector('MATH');
-    const {factor, offset, formula} = mathEl ? parseMathEquation(mathEl.getAttribute('equation') || 'X') : {
-        factor: 1,
-        offset: 0
-    };
+    const {factor, offset, formula, conditional} = parseMathElement(axisEl.querySelector('MATH'));
 
     const unit = axisEl.querySelector('units')?.textContent || '';
     const min = parseFloat(axisEl.querySelector('min')?.textContent || '0');
@@ -259,7 +488,7 @@ function parseAxisElement(axisEl: Element): ParsedAxis | null {
     return {
         address,
         dataType: getDataType(sizeBits, typeFlags),
-        cols, rows, unit, factor, offset, formula, min, max,
+        cols, rows, unit, factor, offset, formula, conditional, outputType, min, max,
         embedded: true,
         points: cols > 1 ? cols : points,
         labels,
@@ -273,7 +502,28 @@ export class XDFParser {
     private baseOffset = 0;
     private bigEndian = false;
     private title = '';
+    private fileName = '';
     private categoryMap: Map<number, string> = new Map();
+    private skipAutogen = true;
+    private preferTitleNames = false;
+
+    constructor(options?: {skipAutogen?: boolean}) {
+        if (typeof options?.skipAutogen === 'boolean') this.skipAutogen = options.skipAutogen;
+    }
+
+    /** Whether duplicate "(autogen)" axis/breakpoint tables are skipped. */
+    getSkipAutogen(): boolean {
+        return this.skipAutogen;
+    }
+
+    setSkipAutogen(value: boolean): void {
+        this.skipAutogen = value;
+    }
+
+    /** True when the XDF carries MHD+ categories; those prefer human titles. */
+    isMhdPlus(): boolean {
+        return this.preferTitleNames;
+    }
 
     parseXDFString(text: string): void {
         const parser = new DOMParser();
@@ -307,9 +557,15 @@ export class XDFParser {
             const name = cat.getAttribute('name') || '';
             if (name) this.categoryMap.set(index, name);
         }
+
+        // MHD+ XDFs carry an explicit "MHD+ Suite" category and prefer the
+        // human titles over the Bosch-style identifiers in descriptions.
+        this.preferTitleNames = Array.from(this.categoryMap.values())
+            .some(catName => /MHD/i.test(catName));
     }
 
     async parseXDF(file: File): Promise<void> {
+        this.fileName = file.name;
         this.parseXDFString(await file.text());
     }
 
@@ -322,8 +578,19 @@ export class XDFParser {
 
         // Preserve the source order and parse constants the same way as the CLI
         // parser. XDFs can freely interleave XDFTABLE and XDFCONSTANT elements.
+        const flagWords = new Map<number, {title: string; mask: number; element: Element}[]>();
         for (const element of Array.from(this.xmlDoc.documentElement.children)) {
             const tagName = element.tagName.toUpperCase();
+            if (tagName === 'XDFFLAG') {
+                this.collectFlag(element, flagWords);
+                continue;
+            }
+            if (tagName === 'XDFTABLE' && this.skipAutogen) {
+                const title = element.querySelector('title')?.textContent?.trim() || '';
+                // MHD+ exports each embedded breakpoint axis again as a
+                // standalone table titled "... X (autogen)" / "... Y (autogen)".
+                if (/\(autogen\)\s*$/i.test(title)) continue;
+            }
             const param = tagName === 'XDFTABLE'
                 ? this.parseTable(element)
                 : tagName === 'XDFCONSTANT'
@@ -342,8 +609,15 @@ export class XDFParser {
             parameters.push(param);
         }
 
+        // XDF v1.70 <XDFFLAG> bitfields (e.g. MHD+ "Inhibit Limp" masks) share
+        // one 32-bit word per address; merge them into editable bitmask params.
+        for (const [address, flags] of flagWords) {
+            const flagParam = this.buildFlagParam(address, flags);
+            if (flagParam) parameters.push(flagParam);
+        }
+
         const def: Definition = {
-            name: name || this.title,
+            name: name || this.title || (this.fileName ? this.fileName.replace(/\.xdf$/i, '') : '') || 'XDF Definition',
             version: '1.0',
             baseAddress: this.baseOffset,
             parameters,
@@ -371,6 +645,80 @@ export class XDFParser {
         return cats;
     }
 
+    /**
+     * Picks a stable id + display name + human description.
+     * Legacy A2L-generated XDFs name the parameter by the technical id that
+     * leads the description; MHD+ XDFs (which carry an "MHD+ Suite" category)
+     * keep the human title as the name and only use the technical id as `id`.
+     */
+    private resolveIdentity(title: string, xdfDesc: string): { name: string; description: string; id: string } {
+        const lines = (xdfDesc || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+        const technicalLine = lines.find(isTechnicalId) || '';
+
+        if (technicalLine && !this.preferTitleNames) {
+            return {name: technicalLine, description: title !== technicalLine ? title : '', id: ''};
+        }
+        if (technicalLine) {
+            return {
+                name: title,
+                description: lines.filter(l => l !== technicalLine).join('\n'),
+                id: normalizeArrayIndices(technicalLine),
+            };
+        }
+        if (this.preferTitleNames) {
+            return {
+                name: title,
+                description: xdfDesc && xdfDesc !== title ? xdfDesc : '',
+                id: normalizeArrayIndices(title),
+            };
+        }
+        return {
+            name: title,
+            description: xdfDesc && xdfDesc !== title ? `${title} — ${xdfDesc}` : title,
+            id: '',
+        };
+    }
+
+    private collectFlag(element: Element, into: Map<number, {title: string; mask: number; element: Element}[]>): void {
+        const embed = element.querySelector('EMBEDDEDDATA') || element.querySelector('embeddedData');
+        const address = parseAddress(embed?.getAttribute('mmedaddress') ?? null);
+        if (address === null) return;
+        const mask = parseInteger(element.querySelector('mask')?.textContent ?? null, 0);
+        const title = element.querySelector('title')?.textContent || '';
+        const list = into.get(address) ?? [];
+        list.push({title, mask, element});
+        into.set(address, list);
+    }
+
+    private buildFlagParam(
+        address: number,
+        flags: {title: string; mask: number; element: Element}[]
+    ): IDefinitionParameter | null {
+        const bitLabels: Record<string, string> = {};
+        for (const f of flags) {
+            // single-bit mask → editable bit index
+            if (f.mask > 0 && (f.mask & (f.mask - 1)) === 0) {
+                bitLabels[String(Math.round(Math.log2(f.mask)))] = f.title;
+            }
+        }
+        const categories = this.resolveCategories(flags[0].element);
+        return {
+            id: `xdf-flag-0x${address.toString(16)}`,
+            name: `Error inhibit flags (0x${address.toString(16).toUpperCase()})`,
+            description: flags.map(f => f.title).join(', '),
+            address,
+            type: 'VALUE',
+            dataType: 'ULONG',
+            unit: '',
+            min: 0,
+            max: 0xFFFFFFFF,
+            factor: 1,
+            offset: 0,
+            bitLabels,
+            categories: categories.length > 0 ? categories : ['Uncategorized'],
+        };
+    }
+
     private parseTable(element: Element): IDefinitionParameter | null {
         // Table flags: bit 5 (0x20) = COLUMN_DIR
         const flags = parseInt(element.getAttribute('flags') || '0', 16);
@@ -378,21 +726,7 @@ export class XDFParser {
 
         const title = element.querySelector('title')?.textContent || '';
         const xdfDesc = element.querySelector('description')?.textContent || '';
-
-        // Detect A2L-generated XDFs: description first line is A2L ID
-        const descLines = xdfDesc.split(/[\r\n]+/);
-        const firstLine = (descLines[0] || '').trim();
-        const isA2lId = firstLine && !firstLine.includes(' ') && (firstLine.includes('_') || firstLine.includes('['));
-
-        let name: string;
-        let description: string;
-        if (isA2lId) {
-            name = firstLine;
-            description = title !== firstLine ? title : '';
-        } else {
-            name = title;
-            description = xdfDesc && xdfDesc !== title ? `${title} — ${xdfDesc}` : title;
-        }
+        const {name, description, id} = this.resolveIdentity(title, xdfDesc);
 
         // Parse axes
         let xAxisData: ParsedAxis | null = null;
@@ -421,6 +755,7 @@ export class XDFParser {
         const categories = this.resolveCategories(element);
 
         const param: IDefinitionParameter = {
+            ...(id ? {id} : {}),
             name,
             description,
             address: zAxisData.address,
@@ -431,6 +766,8 @@ export class XDFParser {
             max: zAxisData.max,
             factor: zAxisData.factor,
             offset: zAxisData.offset,
+            ...(zAxisData.formula ? {formula: zAxisData.formula} : {}),
+            ...(zAxisData.conditional ? {conditional: zAxisData.conditional} : {}),
             categories: categories.length > 0 ? categories : ['Uncategorized'],
         };
 
@@ -455,6 +792,8 @@ export class XDFParser {
             };
             if (xAxisData.factor !== 1) axis.factor = xAxisData.factor;
             if (xAxisData.offset !== 0) axis.offset = xAxisData.offset;
+            if (xAxisData.formula) axis.formula = xAxisData.formula;
+            if (xAxisData.conditional) axis.conditional = xAxisData.conditional;
             if (xAxisData.labels) axis.labels = xAxisData.labels;
             param.xAxis = axis;
         } else if (xAxisData && !xAxisData.embedded && type !== 'VALUE') {
@@ -476,12 +815,28 @@ export class XDFParser {
             };
             if (yAxisData.factor !== 1) axis.factor = yAxisData.factor;
             if (yAxisData.offset !== 0) axis.offset = yAxisData.offset;
+            if (yAxisData.formula) axis.formula = yAxisData.formula;
+            if (yAxisData.conditional) axis.conditional = yAxisData.conditional;
             if (yAxisData.labels) axis.labels = yAxisData.labels;
             param.yAxis = axis;
         } else if (yAxisData && !yAxisData.embedded && type === 'MAP') {
             const axis: AxisDefinition = {type: 'FIX_AXIS', points: yAxisData.points ?? rows, min: 0, max: 0, unit: ''};
             if (yAxisData.labels) axis.labels = yAxisData.labels;
             param.yAxis = axis;
+        }
+
+        // MHD+ scalar toggles/enums carry outputtype="4" LABELs on one axis
+        // (e.g. "Map 1".."Map 4", "ON"/"OFF"). Expose them as enumLabels.
+        if (type === 'VALUE') {
+            const enumAxis = [xAxisData, yAxisData, zAxisData]
+                .find(a => a && a.outputType === 4 && a.labels && a.labels.length >= 2);
+            if (enumAxis?.labels) {
+                const enumLabels: Record<string, string> = {};
+                enumAxis.labels.forEach((label, i) => {
+                    enumLabels[String(i)] = label;
+                });
+                param.enumLabels = enumLabels;
+            }
         }
 
         return param;
@@ -504,13 +859,9 @@ export class XDFParser {
         const typeFlags = parseInteger(embed.getAttribute('mmedtypeflags'), 0);
         const dataType = getDataType(sizeBits, typeFlags);
 
-        const mathEl = element.querySelector('MATH');
-        const {
-            factor: parsedFactor,
-            offset,
-            formula
-        } = mathEl ? parseMathEquation(mathEl.getAttribute('equation') || 'X') : {factor: 1, offset: 0};
-        const factor = PARAM_FACTOR_OVERRIDES[id] ?? parsedFactor;
+        const math = parseMathElement(element.querySelector('MATH'));
+        const factor = PARAM_FACTOR_OVERRIDES[id] ?? math.factor;
+        const {offset, formula, conditional} = math;
 
         const unit = element.querySelector('units')?.textContent || '';
         const minText = element.querySelector('min')?.textContent;
@@ -527,7 +878,9 @@ export class XDFParser {
             address: address,
             type: 'VALUE',
             dataType,
-            unit, min, max, factor, offset, formula,
+            unit, min, max, factor, offset,
+            ...(formula ? {formula} : {}),
+            ...(conditional ? {conditional} : {}),
             categories: categories.length > 0 ? categories : ['Uncategorized'],
         };
     }
